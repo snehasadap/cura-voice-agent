@@ -1,4 +1,4 @@
-# Voice Sandwich Demo 🥪
+# Cura AI Demo
 
 A real-time, voice-to-voice AI pipeline demo featuring a sandwich shop order assistant. Built with LangChain/LangGraph agents, AssemblyAI for speech-to-text, and Cartesia for text-to-speech.
 

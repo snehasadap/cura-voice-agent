@@ -56,7 +56,7 @@
 
   {#if $session.connected}
     <div class="mt-3 py-2.5 px-3.5 bg-cyan-400/10 border border-cyan-400/20 rounded-lg text-xs text-gray-600 text-center">
-      💡 Session is active — just speak naturally. End session when you're done.
+      💡 Session is active — describe your symptoms or the specialist you need. End session when you're done.
     </div>
   {/if}
 </div>

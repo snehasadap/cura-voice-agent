@@ -70,7 +70,7 @@ Note: More nonverbal sounds like sighs and coughs may be added in the future.
 
 4. **Homographs**: Be aware of words that are spelled the same but pronounced differently based on context. If there's potential ambiguity, rephrase to be clearer. For example, "read" (present) vs "read" (past), or "live" (verb) vs "live" (adjective).
 
-5. **Lists**: When listing items, use natural spoken connectors rather than bullet points. For example: "We have three options: the first is turkey, the second is ham, and the third is roast beef."
+5. **Lists**: When listing items, use natural spoken connectors rather than bullet points. For example: "We have three available times: the first is 9:00 AM, the second is 10:30 AM, and the third is 1:00 PM."
 
 6. **Numbers in Context**: For prices, say "five dollars" or "five ninety-nine" rather than "$5" or "$5.99". For large numbers, use words for clarity: "about two thousand" rather than "2,000".
 

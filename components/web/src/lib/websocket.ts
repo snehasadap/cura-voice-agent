@@ -28,7 +28,6 @@ export function createVoiceSession(): VoiceSession {
     switch (event.type) {
       case "stt_chunk":
         if (!turn.active) {
-          // New turn - save previous waterfall data and reset
           const prevTurn = get(currentTurn);
           if (prevTurn.turnStartTs) {
             waterfallData.set({ ...prevTurn });
@@ -37,14 +36,19 @@ export function createVoiceSession(): VoiceSession {
         }
         currentTurn.sttStart(event.ts);
         currentTurn.sttChunk(event.transcript);
+        // Update the live card in place — no new card per word
+        activities.setLive(event.transcript);
         break;
 
       case "stt_output":
         currentTurn.sttEnd(event.ts, event.transcript);
-        activities.add("stt", "Transcription", event.transcript);
+        // Keep updating the same live card with the latest final text
+        activities.setLive(event.transcript);
         break;
 
       case "agent_chunk":
+        // First agent token commits the live transcript card permanently
+        activities.commitLive();
         currentTurn.agentChunk(event.ts, event.text);
         break;
 

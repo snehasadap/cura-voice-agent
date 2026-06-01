@@ -38,47 +38,126 @@ const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
 app.use("/*", cors());
 
-const addToOrder = tool(
-  async ({ item, quantity }) => {
-    return `Added ${quantity} x ${item} to the order.`;
+// ---------------------------------------------------------------------------
+// In-memory appointment store — persists for the lifetime of the server
+// ---------------------------------------------------------------------------
+const ALL_SLOTS = ["9:00 AM", "10:30 AM", "1:00 PM", "2:30 PM", "4:00 PM"];
+
+interface Appointment {
+  patientName: string;
+  specialty: string;
+  date: string;
+  time: string;
+  confirmationCode: string;
+}
+
+const appointments = new Map<string, Appointment>();
+
+function bookedSlots(specialty: string, date: string): Set<string> {
+  const taken = new Set<string>();
+  for (const a of appointments.values()) {
+    if (a.specialty.toLowerCase() === specialty.toLowerCase() &&
+        a.date.toLowerCase() === date.toLowerCase()) {
+      taken.add(a.time);
+    }
+  }
+  return taken;
+}
+
+const checkAvailability = tool(
+  async ({ specialty, preferredDate }) => {
+    const taken = bookedSlots(specialty, preferredDate);
+    const available = ALL_SLOTS.filter(s => !taken.has(s));
+    if (available.length === 0)
+      return `No available slots for ${specialty} on ${preferredDate}. Please try another date.`;
+    return `Available slots for ${specialty} on ${preferredDate}: ${available.join(", ")}.`;
   },
   {
-    name: "add_to_order",
-    description: "Add an item to the customer's sandwich order.",
+    name: "check_availability",
+    description: "Check available appointment slots for a given specialty and preferred date.",
     schema: z.object({
-      item: z.string(),
-      quantity: z.number(),
+      specialty: z.string().describe("The medical specialty or type of doctor"),
+      preferredDate: z.string().describe("The patient's preferred date (e.g. Monday, June 2nd)"),
     }),
   }
 );
 
-const confirmOrder = tool(
-  async ({ orderSummary }) => {
-    return `Order confirmed: ${orderSummary}. Sending to kitchen.`;
+const bookAppointment = tool(
+  async ({ patientName, specialty, date, time }) => {
+    if (bookedSlots(specialty, date).has(time))
+      return `${time} on ${date} is already taken for ${specialty}. Please choose another slot.`;
+    const code = `HC${Math.floor(10000 + Math.random() * 90000)}`;
+    appointments.set(code, { patientName, specialty, date, time, confirmationCode: code });
+    return `Appointment booked for ${patientName} with ${specialty} on ${date} at ${time}. Confirmation code: ${code}.`;
   },
   {
-    name: "confirm_order",
-    description: "Confirm the final order with the customer.",
+    name: "book_appointment",
+    description: "Book an appointment for the patient once they have chosen a slot.",
     schema: z.object({
-      orderSummary: z.string().describe("Summary of the order"),
+      patientName: z.string().describe("Full name of the patient"),
+      specialty: z.string().describe("The medical specialty"),
+      date: z.string().describe("Appointment date"),
+      time: z.string().describe("Appointment time"),
+    }),
+  }
+);
+
+const listAppointments = tool(
+  async ({ patientName }) => {
+    const appts = [...appointments.values()].filter(
+      a => a.patientName.toLowerCase() === patientName.toLowerCase()
+    );
+    if (appts.length === 0) return `No appointments found for ${patientName}.`;
+    const lines = appts.map(
+      a => `${a.specialty} on ${a.date} at ${a.time} — confirmation ${a.confirmationCode}`
+    );
+    return `Appointments for ${patientName}: ${lines.join("; ")}.`;
+  },
+  {
+    name: "list_appointments",
+    description: "List all appointments for a patient by name.",
+    schema: z.object({
+      patientName: z.string().describe("Full name of the patient"),
+    }),
+  }
+);
+
+const cancelAppointment = tool(
+  async ({ confirmationCode }) => {
+    const appt = appointments.get(confirmationCode.toUpperCase());
+    if (!appt) return `No appointment found with confirmation code ${confirmationCode}.`;
+    appointments.delete(confirmationCode.toUpperCase());
+    return `Appointment ${confirmationCode} for ${appt.patientName} (${appt.specialty} on ${appt.date} at ${appt.time}) has been cancelled.`;
+  },
+  {
+    name: "cancel_appointment",
+    description: "Cancel an appointment by confirmation code.",
+    schema: z.object({
+      confirmationCode: z.string().describe("The confirmation code from the booking"),
     }),
   }
 );
 
 const systemPrompt = `
-You are a helpful sandwich shop assistant. Your goal is to take the user's order.
-Be concise and friendly.
+You are a friendly and professional healthcare receptionist. Your goal is to help patients book, view, and cancel medical appointments.
+Be concise, empathetic, and clear.
 
-Available toppings: lettuce, tomato, onion, pickles, mayo, mustard.
-Available meats: turkey, ham, roast beef.
-Available cheeses: swiss, cheddar, provolone.
+Available specialties: general practice, cardiology, dermatology, orthopedics, pediatrics, neurology.
+Available days: Monday through Friday.
+Available hours: 9:00 AM to 5:00 PM in 90-minute slots.
+
+To book an appointment collect: patient full name, specialty or reason for visit, preferred date and time.
+Use check_availability to show open slots before booking.
+Use book_appointment once the patient confirms a slot.
+Use list_appointments when a patient wants to see their upcoming appointments.
+Use cancel_appointment when a patient wants to cancel using their confirmation code.
 
 ${CARTESIA_TTS_SYSTEM_PROMPT}
 `;
 
 const agent = createAgent({
   model: "claude-haiku-4-5",
-  tools: [addToOrder, confirmOrder],
+  tools: [checkAvailability, bookAppointment, listAppointments, cancelAppointment],
   checkpointer: new MemorySaver(),
   systemPrompt: systemPrompt,
 });
@@ -156,55 +235,90 @@ async function* sttStream(
 async function* agentStream(
   eventStream: AsyncIterable<VoiceAgentEvent>
 ): AsyncGenerator<VoiceAgentEvent> {
-  // Generate a unique thread ID for this conversation session
-  // This allows the agent to maintain conversation context across multiple turns
-  // using the checkpointer (MemorySaver) configured in the agent
   const threadId = uuidv4();
+  const passthrough = writableIterator<VoiceAgentEvent>();
 
-  for await (const event of eventStream) {
-    yield event;
-    if (event.type === "stt_output") {
-      const stream = await agent.stream(
-        { messages: [new HumanMessage(event.transcript)] },
-        {
-          configurable: { thread_id: threadId },
-          streamMode: "messages",
-        }
-      );
+  let transcriptBuffer: string[] = [];
+  let latestTranscript = "";
+  let debounceTimer: NodeJS.Timeout | null = null;
 
-      for await (const [message] of stream) {
-        if (AIMessage.isInstance(message) && message.tool_calls) {
-          yield { type: "agent_chunk", text: message.text, ts: Date.now() };
-          for (const toolCall of message.tool_calls) {
-            yield {
-              type: "tool_call",
-              id: toolCall.id ?? uuidv4(),
-              name: toolCall.name,
-              args: toolCall.args,
-              ts: Date.now(),
-            };
-          }
-        }
-        if (ToolMessage.isInstance(message)) {
-          yield {
-            type: "tool_result",
-            toolCallId: message.tool_call_id ?? "",
-            name: message.name ?? "unknown",
-            result:
-              typeof message.content === "string"
-                ? message.content
-                : JSON.stringify(message.content),
+  async function runAgent(transcript: string) {
+    const stream = await agent.stream(
+      { messages: [new HumanMessage(transcript)] },
+      {
+        configurable: { thread_id: threadId },
+        streamMode: "messages",
+      }
+    );
+
+    for await (const [message] of stream) {
+      if (AIMessage.isInstance(message) && message.tool_calls) {
+        passthrough.push({ type: "agent_chunk", text: message.text, ts: Date.now() });
+
+        for (const toolCall of message.tool_calls) {
+          passthrough.push({
+            type: "tool_call",
+            id: toolCall.id ?? uuidv4(),
+            name: toolCall.name,
+            args: toolCall.args,
             ts: Date.now(),
-          };
+          });
         }
       }
 
-      // Signal that the agent has finished responding for this turn
-      yield { type: "agent_end", ts: Date.now() };
+      if (ToolMessage.isInstance(message)) {
+        passthrough.push({
+          type: "tool_result",
+          toolCallId: message.tool_call_id ?? "",
+          name: message.name ?? "unknown",
+          result:
+            typeof message.content === "string"
+              ? message.content
+              : JSON.stringify(message.content),
+          ts: Date.now(),
+        });
+      }
     }
+
+    passthrough.push({ type: "agent_end", ts: Date.now() });
+  }
+
+  const producer = iife(async () => {
+    for await (const event of eventStream) {
+      passthrough.push(event);
+
+      // Accumulate all stt_output fragments — if an utterance is split across
+      // multiple end-of-turn events they get joined before the agent sees them.
+      if (event.type === "stt_output") {
+        transcriptBuffer.push(event.transcript);
+        latestTranscript = transcriptBuffer.join(" ");
+      }
+
+      // Reset debounce on any speech activity so mid-sentence fragments don't
+      // fire the agent while the user is still talking.
+      if (event.type === "stt_chunk" || event.type === "stt_output") {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        if (latestTranscript) {
+          debounceTimer = setTimeout(() => {
+            const transcript = latestTranscript;
+            transcriptBuffer = [];
+            latestTranscript = "";
+            void runAgent(transcript);
+          }, 250);
+        }
+      }
+    }
+  });
+
+  try {
+    yield* passthrough;
+  } finally {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+    }
+    await producer;
   }
 }
-
 /**
  * Transform stream: Voice Events → Voice Events (with Audio)
  *

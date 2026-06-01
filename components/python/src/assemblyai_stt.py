@@ -67,14 +67,11 @@ class AssemblyAISTT:
                                 pass
                             elif message_type == "Turn":
                                 transcript = message.get("transcript", "")
-                                turn_is_formatted = message.get(
-                                    "turn_is_formatted", False
-                                )
+                                end_of_turn = message.get("end_of_turn", False)
 
-                                if turn_is_formatted:
-                                    if transcript:
-                                        yield STTOutputEvent.create(transcript)
-                                else:
+                                if end_of_turn and transcript:
+                                    yield STTOutputEvent.create(transcript)
+                                elif transcript:
                                     yield STTChunkEvent.create(transcript)
 
                             elif message_type == "Termination":
@@ -112,6 +109,10 @@ class AssemblyAISTT:
             {
                 "sample_rate": self.sample_rate,
                 "format_turns": str(self.format_turns).lower(),
+                "speech_model": "universal-streaming-english",
+                "end_of_turn_confidence_threshold": "0.7",
+                "min_end_of_turn_silence_when_confident": "320",
+                "max_turn_silence": "2000",
             }
         )
         url = f"wss://streaming.assemblyai.com/v3/ws?{params}"

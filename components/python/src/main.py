@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import random
 from pathlib import Path
 from typing import AsyncIterator
 from uuid import uuid4
@@ -7,15 +8,16 @@ from uuid import uuid4
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
+from starlette.websockets import WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from langchain.agents import create_agent
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
-from langchain_core.runnables import RunnableGenerator
 from langgraph.checkpoint.memory import InMemorySaver
 from starlette.staticfiles import StaticFiles
 
 from assemblyai_stt import AssemblyAISTT
-from components.python.src.cartesia_tts import CartesiaTTS
+from cartesia_prompts import CARTESIA_TTS_SYSTEM_PROMPT
+from cartesia_tts import CartesiaTTS
 from events import (
     AgentChunkEvent,
     AgentEndEvent,
@@ -48,30 +50,93 @@ app.add_middleware(
 )
 
 
-def add_to_order(item: str, quantity: int) -> str:
-    """Add an item to the customer's sandwich order."""
-    return f"Added {quantity} x {item} to the order."
+# ---------------------------------------------------------------------------
+# In-memory appointment store — persists for the lifetime of the server
+# ---------------------------------------------------------------------------
+_ALL_SLOTS = ["9:00 AM", "10:30 AM", "1:00 PM", "2:30 PM", "4:00 PM"]
+
+# confirmation_code -> appointment dict
+_appointments: dict[str, dict] = {}
 
 
-def confirm_order(order_summary: str) -> str:
-    """Confirm the final order with the customer."""
-    return f"Order confirmed: {order_summary}. Sending to kitchen."
+def _booked_slots(specialty: str, date: str) -> set[str]:
+    return {
+        a["time"]
+        for a in _appointments.values()
+        if a["specialty"].lower() == specialty.lower()
+        and a["date"].lower() == date.lower()
+    }
 
 
-system_prompt = """
-You are a helpful sandwich shop assistant. Your goal is to take the user's order.
-Be concise and friendly.
+def check_availability(specialty: str, preferred_date: str) -> str:
+    """Check available appointment slots for a given specialty and date."""
+    available = [s for s in _ALL_SLOTS if s not in _booked_slots(specialty, preferred_date)]
+    if not available:
+        return f"No available slots for {specialty} on {preferred_date}. Please try another date."
+    return f"Available slots for {specialty} on {preferred_date}: {', '.join(available)}."
 
-Available toppings: lettuce, tomato, onion, pickles, mayo, mustard.
-Available meats: turkey, ham, roast beef.
-Available cheeses: swiss, cheddar, provolone.
 
-${CARTESIA_TTS_SYSTEM_PROMPT}
+def book_appointment(patient_name: str, specialty: str, date: str, time: str) -> str:
+    """Book an appointment for the patient."""
+    if time in _booked_slots(specialty, date):
+        return f"{time} on {date} is already taken for {specialty}. Please choose another slot."
+    code = f"HC{random.randint(10000, 99999)}"
+    _appointments[code] = {
+        "patient_name": patient_name,
+        "specialty": specialty,
+        "date": date,
+        "time": time,
+        "confirmation_code": code,
+    }
+    return (
+        f"Appointment booked for {patient_name} with {specialty} on {date} at {time}. "
+        f"Confirmation code: {code}."
+    )
+
+
+def list_appointments(patient_name: str) -> str:
+    """List all appointments for a patient."""
+    appts = [a for a in _appointments.values() if a["patient_name"].lower() == patient_name.lower()]
+    if not appts:
+        return f"No appointments found for {patient_name}."
+    lines = [
+        f"{a['specialty']} on {a['date']} at {a['time']} — confirmation {a['confirmation_code']}"
+        for a in appts
+    ]
+    return f"Appointments for {patient_name}: " + "; ".join(lines) + "."
+
+
+def cancel_appointment(confirmation_code: str) -> str:
+    """Cancel an appointment by confirmation code."""
+    appt = _appointments.pop(confirmation_code.upper(), None)
+    if not appt:
+        return f"No appointment found with confirmation code {confirmation_code}."
+    return (
+        f"Appointment {confirmation_code} for {appt['patient_name']} "
+        f"({appt['specialty']} on {appt['date']} at {appt['time']}) has been cancelled."
+    )
+
+
+system_prompt = f"""
+You are a friendly and professional healthcare receptionist. Your goal is to help patients book, view, and cancel medical appointments.
+Be concise, empathetic, and clear.
+
+Available specialties: general practice, cardiology, dermatology, orthopedics, pediatrics, neurology.
+Available days: Monday through Friday.
+Available hours: 9:00 AM to 5:00 PM in 90-minute slots.
+
+To book an appointment collect: patient full name, specialty or reason for visit, preferred date and time.
+Use check_availability to show open slots before booking.
+Use book_appointment once the patient confirms a slot.
+Use list_appointments when a patient wants to see their upcoming appointments.
+Use cancel_appointment when a patient wants to cancel using their confirmation code.
+
+{CARTESIA_TTS_SYSTEM_PROMPT}
 """
 
 agent = create_agent(
     model="anthropic:claude-haiku-4-5",
-    tools=[add_to_order, confirm_order],
+    tools=[check_availability, book_appointment, list_appointments, cancel_appointment],
     system_prompt=system_prompt,
     checkpointer=InMemorySaver(),
 )
@@ -140,71 +205,81 @@ async def _stt_stream(
 async def _agent_stream(
     event_stream: AsyncIterator[VoiceAgentEvent],
 ) -> AsyncIterator[VoiceAgentEvent]:
-    """
-    Transform stream: Voice Events → Voice Events (with Agent Responses)
-
-    This function takes a stream of upstream voice agent events and processes them.
-    When an stt_output event arrives, it passes the transcript to the LangChain agent.
-    The agent streams back its response tokens as agent_chunk events.
-    Tool calls and results are also emitted as separate events.
-    All other upstream events are passed through unchanged.
-
-    The passthrough pattern ensures downstream stages (like TTS) can observe all
-    events in the pipeline, not just the ones this stage produces. This enables
-    features like displaying partial transcripts while the agent is thinking.
-
-    Args:
-        event_stream: An async iterator of upstream voice agent events
-
-    Yields:
-        All upstream events plus agent_chunk, tool_call, and tool_result events
-    """
-    # Generate a unique thread ID for this conversation session
-    # This allows the agent to maintain conversation context across multiple turns
-    # using the checkpointer (InMemorySaver) configured in the agent
     thread_id = str(uuid4())
+    queue: asyncio.Queue[VoiceAgentEvent | object] = asyncio.Queue()
+    _sentinel = object()
 
-    # Process each event as it arrives from the upstream STT stage
-    async for event in event_stream:
-        # Pass through all events to downstream consumers
-        yield event
+    accumulated: list[str] = []
+    latest_transcript: str | None = None
+    pending_task: asyncio.Task | None = None
 
-        # When we receive a final transcript, invoke the agent
-        if event.type == "stt_output":
-            # Stream the agent's response using LangChain's astream method.
-            # stream_mode="messages" yields message chunks as they're generated.
-            stream = agent.astream(
-                {"messages": [HumanMessage(content=event.transcript)]},
-                {"configurable": {"thread_id": thread_id}},
-                stream_mode="messages",
-            )
+    async def run_agent(transcript: str) -> None:
+        stream = agent.astream(
+            {"messages": [HumanMessage(content=transcript)]},
+            {"configurable": {"thread_id": thread_id}},
+            stream_mode="messages",
+        )
+        async for message, _ in stream:
+            if isinstance(message, AIMessage) and message.text:
+                await queue.put(AgentChunkEvent.create(message.text))
+            if isinstance(message, AIMessage) and hasattr(message, "tool_calls") and message.tool_calls:
+                for tc in message.tool_calls:
+                    await queue.put(ToolCallEvent.create(
+                        id=tc.get("id", str(uuid4())),
+                        name=tc.get("name", "unknown"),
+                        args=tc.get("args", {}),
+                    ))
+            if isinstance(message, ToolMessage):
+                await queue.put(ToolResultEvent.create(
+                    tool_call_id=getattr(message, "tool_call_id", ""),
+                    name=getattr(message, "name", "unknown"),
+                    result=str(message.content) if message.content else "",
+                ))
+        await queue.put(AgentEndEvent.create())
 
-            # Iterate through the agent's streaming response. The stream yields
-            # tuples of (message, metadata), but we only need the message.
-            async for message, metadata in stream:
-                # Emit agent chunks (AI messages)
-                if isinstance(message, AIMessage):
-                    # Extract and yield the text content from each message chunk
-                    yield AgentChunkEvent.create(message.text)
-                    # Emit tool calls if present
-                    if hasattr(message, "tool_calls") and message.tool_calls:
-                        for tool_call in message.tool_calls:
-                            yield ToolCallEvent.create(
-                                id=tool_call.get("id", str(uuid4())),
-                                name=tool_call.get("name", "unknown"),
-                                args=tool_call.get("args", {}),
-                            )
+    async def reset_debounce() -> None:
+        nonlocal pending_task
+        if pending_task and not pending_task.done():
+            pending_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending_task
 
-                # Emit tool results (tool messages)
-                if isinstance(message, ToolMessage):
-                    yield ToolResultEvent.create(
-                        tool_call_id=getattr(message, "tool_call_id", ""),
-                        name=getattr(message, "name", "unknown"),
-                        result=str(message.content) if message.content else "",
-                    )
+        async def debounced() -> None:
+            nonlocal latest_transcript
+            await asyncio.sleep(0.25)
+            transcript = latest_transcript
+            accumulated.clear()
+            latest_transcript = None
+            if transcript:
+                await run_agent(transcript)
 
-            # Signal that the agent has finished responding for this turn
-            yield AgentEndEvent.create()
+        pending_task = asyncio.create_task(debounced())
+
+    async def producer() -> None:
+        nonlocal latest_transcript
+        async for event in event_stream:
+            await queue.put(event)
+            if event.type == "stt_output":
+                # Accumulate fragments — utterances split across turns get joined
+                accumulated.append(event.transcript)
+                latest_transcript = " ".join(accumulated)
+            if event.type in ("stt_chunk", "stt_output"):
+                await reset_debounce()
+        if pending_task and not pending_task.done():
+            await pending_task
+        await queue.put(_sentinel)
+
+    task = asyncio.create_task(producer())
+    try:
+        while True:
+            item = await queue.get()
+            if item is _sentinel:
+                break
+            yield item  # type: ignore[misc]
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def _tts_stream(
@@ -268,28 +343,25 @@ async def _tts_stream(
         await tts.close()
 
 
-pipeline = (
-    RunnableGenerator(_stt_stream)  # Audio -> STT events
-    | RunnableGenerator(_agent_stream)  # STT events -> STT + Agent events
-    | RunnableGenerator(_tts_stream)  # STT + Agent events -> All events
-)
-
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
     async def websocket_audio_stream() -> AsyncIterator[bytes]:
-        """Async generator that yields audio bytes from the websocket."""
-        while True:
-            data = await websocket.receive_bytes()
-            yield data
+        try:
+            while True:
+                data = await websocket.receive_bytes()
+                yield data
+        except WebSocketDisconnect:
+            return
 
-    output_stream = pipeline.atransform(websocket_audio_stream())
+    output_stream = _tts_stream(_agent_stream(_stt_stream(websocket_audio_stream())))
 
-    # Process all events from the pipeline, sending events back to the client
-    async for event in output_stream:
-        await websocket.send_json(event_to_dict(event))
+    try:
+        async for event in output_stream:
+            await websocket.send_json(event_to_dict(event))
+    except WebSocketDisconnect:
+        pass
 
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: false
+  ffmpeg-static: false
+  onnxruntime-node: false

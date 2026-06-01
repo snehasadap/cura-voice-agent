@@ -5,6 +5,14 @@
   // Use current turn if active, otherwise preserved waterfall data
   let data = $derived($currentTurn.active ? $currentTurn : $waterfallData);
 
+  // Reactive clock so active bars grow in real time
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!$currentTurn.active) return;
+    const id = setInterval(() => { now = Date.now(); }, 50);
+    return () => clearInterval(id);
+  });
+
   interface BarStyle {
     left: string;
     width: string;
@@ -20,7 +28,6 @@
   ): BarStyle {
     if (!startTs) return { left: '0%', width: '0%', opacity: 0 };
 
-    const now = Date.now();
     const left = ((startTs - baseTime) / totalDuration) * 100;
 
     let end: number;
@@ -38,7 +45,7 @@
 
   function getDuration(startTs: number | null, endTs: number | null, isActiveNow: boolean): string {
     if (!startTs) return '—';
-    if (!endTs && isActiveNow) return formatDuration(Date.now() - startTs);
+    if (!endTs && isActiveNow) return formatDuration(now - startTs);
     if (!endTs) return '—';
     return formatDuration(endTs - startTs);
   }
@@ -47,7 +54,6 @@
     if (!data?.turnStartTs) return null;
 
     const baseTime = data.turnStartTs;
-    const now = Date.now();
     const isActive = $currentTurn.active;
 
     // Calculate end time for scaling
@@ -81,7 +87,7 @@
       return formatDuration(data.ttsEndTs - data.sttStartTs);
     }
     if ($currentTurn.active && data.sttStartTs) {
-      return formatDuration(Date.now() - data.sttStartTs);
+      return formatDuration(now - data.sttStartTs);
     }
     return '—';
   });
@@ -143,4 +149,3 @@
     </div>
   </div>
 </div>
-

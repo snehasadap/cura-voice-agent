@@ -25,6 +25,10 @@ export class AssemblyAISTT {
       const params = new URLSearchParams({
         sample_rate: this.sampleRate.toString(),
         format_turns: this.formatTurns.toString().toLowerCase(),
+        speech_model: "universal-streaming-english",
+        end_of_turn_confidence_threshold: "0.7",
+        min_end_of_turn_silence_when_confident: "320",
+        max_turn_silence: "2000",
       });
 
       const url = `wss://streaming.assemblyai.com/v3/ws?${params.toString()}`;
@@ -42,12 +46,11 @@ export class AssemblyAISTT {
           if (message.type === "Begin") {
             // no-op
           } else if (message.type === "Turn") {
-            if (message.turn_is_formatted) {
-              if (message.transcript) {
-                this._bufferIterator.push({ type: "stt_output", transcript: message.transcript, ts: Date.now() });
-              }
-            } else {
-              this._bufferIterator.push({ type: "stt_chunk", transcript: message.transcript, ts: Date.now() });
+            const transcript = message.transcript ?? "";
+            if (message.end_of_turn && transcript) {
+              this._bufferIterator.push({ type: "stt_output", transcript, ts: Date.now() });
+            } else if (transcript) {
+              this._bufferIterator.push({ type: "stt_chunk", transcript, ts: Date.now() });
             }
           } else if (message.type === "Termination") {
             // no-op
@@ -76,7 +79,7 @@ export class AssemblyAISTT {
   constructor(options: AssemblyAISTTOptions) {
     this.apiKey = options.apiKey || process.env.ASSEMBLYAI_API_KEY || "";
     this.sampleRate = options.sampleRate || 16000;
-    this.formatTurns = options.formatTurns || true;
+    this.formatTurns = options.formatTurns ?? true;
 
     if (!this.apiKey) {
       throw new Error("AssemblyAI API key is required");
