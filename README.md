@@ -1,6 +1,6 @@
 # Cura AI Demo
 
-A real-time, voice-to-voice AI pipeline demo featuring a sandwich medical appointment scheduling assistant. Built with LangChain/LangGraph agents, AssemblyAI for speech-to-text, and Cartesia for text-to-speech.
+A real-time, voice-to-voice AI pipeline demo featuring a medical appointment scheduling assistant. Built with LangChain/LangGraph agents, AssemblyAI for speech-to-text, and Cartesia for text-to-speech.
 
 ## Architecture
 
